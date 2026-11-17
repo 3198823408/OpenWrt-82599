@@ -1,0 +1,232 @@
+name: Build OpenWrt for x86_64 82599 Ruijie
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+    - name: 检出代码
+      uses: actions/checkout@v3
+
+    - name: 初始化 Ubuntu 编译环境
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo -E apt-get -qq update
+        sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp nano ninja-build pbuilder psmisc python3 python3-pyelftools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+        sudo -E apt-get -qq autoremove --purge
+        sudo -E apt-get -qq clean
+
+    - name: 拉取源码 (ImmortalWrt 23.05)
+      run: |
+        git clone -b openwrt-23.05 --single-branch https://github.com/immortalwrt/immortalwrt openwrt
+
+    - name: 更新 Feeds
+      run: |
+        cd openwrt
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: 注入 82599 万兆驱动 + 校园网多开 Web 插件
+      run: |
+        cd openwrt
+        # 1. 创建锐捷 Web 前端管理插件目录
+        mkdir -p package/custom/luci-app-ruijie/luasrc/controller
+        mkdir -p package/custom/luci-app-ruijie/luasrc/view/ruijie
+        
+        # 2. 写入 Web 后端控制器
+        cat << 'EOF' > package/custom/luci-app-ruijie/luasrc/controller/ruijie.lua
+        module("luci.controller.ruijie", package.seeall)
+        function index()
+            entry({"admin", "services", "ruijie"}, template("ruijie/index"), _("校园网多开"), 60)
+            entry({"admin", "services", "ruijie", "action"}, call("action_handle")).leaf = true
+        end
+        function action_handle()
+            local http = require "luci.http"
+            local sys = require "luci.sys"
+            local act = http.formvalue("act")
+            if act == "save" then
+                local data = http.formvalue("accounts")
+                local f = io.open("/etc/ruijie_accounts.txt", "w")
+                if f then f:write(data); f:close() end
+                http.write_json({status = "ok"})
+            elseif act == "run" then
+                sys.exec("/bin/sh /root/ruijie_manager.sh > /tmp/ruijie.log 2>&1 &")
+                http.write_json({status = "running"})
+            elseif act == "status" then
+                local log = sys.exec("tail -n 25 /tmp/ruijie.log 2>/dev/null")
+                local ifaces = sys.exec("ip -br addr show | grep vwan")
+                http.write_json({log = log, ifaces = ifaces})
+            end
+        end
+        EOF
+
+        # 3. 写入 Web 前端界面
+        cat << 'EOF' > package/custom/luci-app-ruijie/luasrc/view/ruijie/index.htm
+        <%+header%>
+        <div class="cbi-map">
+            <h2>🏛️ 锐捷校园网多开 & 万兆聚合控制台</h2>
+            <div class="cbi-map-descr">在下方文本框中批量粘贴账号密码，系统将全自动生成独立 MAC 的万兆虚拟网卡并自动完成 Web 认证。</div>
+            <fieldset class="cbi-section">
+                <legend>账号列表 (每行一个: 账号,密码,运营商后缀，如 @cmcc / @telecom，无后缀留空)</legend>
+                <textarea id="accounts" style="width: 100%; height: 160px; font-family: monospace; padding: 10px; border-radius: 6px; border: 1px solid #ccc;"></textarea>
+                <div style="margin-top: 10px;">
+                    <button class="cbi-button cbi-button-apply" onclick="saveAndRun()">🚀 保存并一键生成网卡+认证</button>
+                    <button class="cbi-button cbi-button-reset" onclick="loadData()">🔄 刷新状态</button>
+                </div>
+            </fieldset>
+            <fieldset class="cbi-section">
+                <legend>虚拟网卡与 IP 状态</legend>
+                <div id="iface-list" style="padding: 10px; background: #fff; border-radius: 6px; border: 1px solid #e5e5e5;"><pre>暂未获取到状态</pre></div>
+            </fieldset>
+            <fieldset class="cbi-section">
+                <legend>实时运行日志</legend>
+                <pre id="log" style="background: #1e1e1e; color: #00ff66; padding: 12px; border-radius: 6px; height: 180px; overflow-y: scroll;"></pre>
+            </fieldset>
+        </div>
+        <script type="text/javascript">
+        function loadData() {
+            XHR.get('<%=url("admin/services/ruijie/action")%>', { act: 'status' }, function(x, res) {
+                if (res) {
+                    document.getElementById('log').innerText = res.log || "暂无日志";
+                    document.getElementById('iface-list').innerHTML = "<pre>" + (res.ifaces || "未检测到 vwan 虚拟网卡，请先导入账号生成。") + "</pre>";
+                }
+            });
+        }
+        function saveAndRun() {
+            var acc = document.getElementById('accounts').value;
+            XHR.post('<%=url("admin/services/ruijie/action")%>', { act: 'save', accounts: acc }, function(x, res) {
+                XHR.post('<%=url("admin/services/ruijie/action")%>', { act: 'run' }, function(x, res) {
+                    alert("任务已提交！后台正在生成万兆虚拟网卡并执行认证...");
+                });
+            });
+        }
+        document.addEventListener("DOMContentLoaded", function() { loadData(); setInterval(loadData, 4000); });
+        </script>
+        <%+footer%>
+        EOF
+
+        # 4. 写入 Makefile 打包插件
+        cat << 'EOF' > package/custom/luci-app-ruijie/Makefile
+        include $(TOPDIR)/rules.mk
+        LUCI_TITLE:=LuCI support for Ruijie Multi-WAN
+        LUCI_PKGARCH:=all
+        include $(TOPDIR)/feeds/luci/luci.mk
+        # call BuildPackage - OpenWrt buildroot signature
+        EOF
+
+        # 5. 写入自动化后台脚本
+        mkdir -p files/root
+        cat << 'EOF' > files/root/ruijie_manager.sh
+        #!/bin/sh
+        PHYSICAL_NIC="eth0"
+        ACCOUNT_FILE="/etc/ruijie_accounts.txt"
+        [ ! -f "$ACCOUNT_FILE" ] && exit 0
+        idx=1
+        while IFS=',' read -r USER PASS OPERATOR || [ -n "$USER" ]; do
+          echo "$USER" | grep -q '^#' && continue
+          [ -z "$USER" ] && continue
+          VWAN="vwan${idx}"
+          if ! ip link show dev "$VWAN" > /dev/null 2>&1; then
+            RAND_MAC="02:$(hexdump -n5 -e '/1 "%02X:"' /dev/urandom | sed 's/:$//')"
+            ip link add link "$PHYSICAL_NIC" name "$VWAN" type macvlan mode bridge
+            ip link set dev "$VWAN" address "$RAND_MAC"
+            ip link set dev "$VWAN" up
+          fi
+          if ! uci get network."$VWAN" > /dev/null 2>&1; then
+            uci set network."$VWAN"=interface
+            uci set network."$VWAN".proto='dhcp'
+            uci set network."$VWAN".device="$VWAN"
+            uci set network."$VWAN".metric=$((100 + idx))
+            uci add_list firewall.@zone[1].network="$VWAN"
+            NEED_RELOAD=1
+          fi
+          idx=$((idx + 1))
+        done < "$ACCOUNT_FILE"
+        if [ "$NEED_RELOAD" = "1" ]; then
+          uci commit network; uci commit firewall
+          /etc/init.d/network reload
+          sleep 4
+        fi
+        idx=1
+        while IFS=',' read -r USER PASS OPERATOR || [ -n "$USER" ]; do
+          echo "$USER" | grep -q '^#' && continue
+          [ -z "$USER" ] && continue
+          VWAN="vwan${idx}"
+          FULL_USER="${USER}${OPERATOR}"
+          ST=$(curl --interface "$VWAN" -s -o /dev/null -w "%{http_code}" --connect-timeout 2 http://connectivitycheck.gstatic.com/generate_204)
+          if [ "$ST" = "204" ]; then
+            echo "[$VWAN] $FULL_USER 正常在线"
+          else
+            echo "[$VWAN] $FULL_USER 发起锐捷认证..."
+            PORTAL_URL=$(curl --interface "$VWAN" -s -I http://1.1.1.1 --connect-timeout 3 | grep -i 'Location:' | awk '{print $2}' | tr -d '\r')
+            if [ -n "$PORTAL_URL" ]; then
+              PORTAL_IP=$(echo "$PORTAL_URL" | awk -F/ '{print $3}')
+              QUERY=$(echo "$PORTAL_URL" | cut -d'?' -f2-)
+              RES=$(curl --interface "$VWAN" -s -X POST "http://${PORTAL_IP}/eportal/InterFace.do?method=login" \
+                -d "userId=${FULL_USER}&password=${PASS}&service=&queryString=${QUERY}&operatorPwd=&operatorUserId=&validCodeUrl=&passwordEncrypt=false")
+              echo "[$VWAN] 登录返回: $RES"
+            fi
+          fi
+          idx=$((idx + 1))
+        done < "$ACCOUNT_FILE"
+        EOF
+        chmod +x files/root/ruijie_manager.sh
+
+        # 6. 生成编译配置
+        cat << 'EOF' > .config
+        CONFIG_TARGET_x86=y
+        CONFIG_TARGET_x86_64=y
+        CONFIG_TARGET_x86_64_DEVICE_generic=y
+
+        # Intel 82599 万兆驱动 & 千兆驱动
+        CONFIG_PACKAGE_kmod-ixgbe=y
+        CONFIG_PACKAGE_kmod-ixgbevf=y
+        CONFIG_PACKAGE_kmod-e1000e=y
+        CONFIG_PACKAGE_kmod-igc=y
+        CONFIG_PACKAGE_kmod-r8169=y
+
+        # 虚拟网卡与多拨负载均衡
+        CONFIG_PACKAGE_kmod-macvlan=y
+        CONFIG_PACKAGE_luci-app-mwan3=y
+        CONFIG_PACKAGE_mwan3=y
+
+        # 认证组件与我们的专属前端插件
+        CONFIG_PACKAGE_curl=y
+        CONFIG_PACKAGE_wget-ssl=y
+        CONFIG_PACKAGE_jq=y
+        CONFIG_PACKAGE_ca-bundle=y
+        CONFIG_PACKAGE_ca-certificates=y
+        CONFIG_PACKAGE_luci-app-ruijie=y
+
+        # 防检测 TTL
+        CONFIG_PACKAGE_iptables-mod-ipopt=y
+        CONFIG_PACKAGE_kmod-ipt-ipopt=y
+
+        # 主题与终端
+        CONFIG_PACKAGE_luci=y
+        CONFIG_PACKAGE_luci-theme-argon=y
+        CONFIG_PACKAGE_luci-app-ttyd=y
+        CONFIG_TARGET_ROOTFS_PARTSIZE=1024
+        EOF
+        make defconfig
+
+    - name: 下载依赖
+      run: |
+        cd openwrt
+        make download -j8
+        find dl -size -1024c -exec rm -f {} \;
+
+    - name: 编译固件
+      run: |
+        cd openwrt
+        make -j$(nproc) || make -j1 V=s
+
+    - name: 打包上传固件到 GitHub 页面
+      uses: actions/upload-artifact@v3
+      with:
+        name: OpenWrt_x86_64_82599_Ruijie
+        path: openwrt/bin/targets/x86/64/*combined-efi.img.gz
